@@ -869,6 +869,7 @@ mod tests {
         fs::write(node.join("bInterfaceNumber"), "05").unwrap();
         fs::write(node.join("device/report_descriptor"), [1, 2, 3]).unwrap();
         assert!(!matches_expected_interface(&node));
+        assert_eq!(matching_device_path(&node, Path::new("/dev")), None);
         assert!(!is_inzone_uevent(""));
     }
 
