@@ -26,8 +26,11 @@ jobs:
       - name: Test with strict coverage
         run: |
           cargo +1.97.1 llvm-cov --all-features --all-targets --workspace --locked \
-            --no-default-ignore-filename-regex \
+            --fail-under-functions 100 \
+            --fail-under-lines 100 \
+            --fail-under-regions 100 \
             --fail-uncovered-lines 0 \
+            --fail-uncovered-regions 0 \
             --fail-uncovered-functions 0 \
             --show-missing-lines
       - name: Check documented MSRV

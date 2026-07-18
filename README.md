@@ -124,9 +124,9 @@ See [docs/protocol.md](docs/protocol.md) for the documented battery protocol.
 The test suite covers protocol parsing, request and response I/O, discovery and
 device verification, CLI output and error branches, tray states and actions,
 refresh scheduling, and real CLI/tray process startup. CI requires zero
-uncovered code-generated source lines and zero uncovered functions, including
-integration-test source. See [CONTRIBUTING.md](CONTRIBUTING.md) for the pinned
-coverage command and an explanation of LLVM's duplicate-instantiation summary.
+uncovered production functions, source lines, and LLVM regions: every displayed
+production coverage metric must be 100.00%. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for the pinned coverage command.
 
 ## Disclaimer
 
