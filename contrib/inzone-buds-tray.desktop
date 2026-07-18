@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=INZONE Buds Battery
+Comment=Show Sony INZONE Buds battery levels in the system tray
+Exec=inzone-buds-tray
+TryExec=inzone-buds-tray
+Icon=audio-headphones
+Terminal=false
+Categories=Utility;

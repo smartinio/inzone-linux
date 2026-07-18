@@ -1,0 +1,27 @@
+[package]
+name = "inzone-buds"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Native Linux battery status for Sony INZONE Buds"
+license = "MIT"
+keywords = ["sony", "inzone", "earbuds", "hid", "linux"]
+categories = ["command-line-utilities", "hardware-support"]
+publish = false
+
+[features]
+default = []
+tray = ["dep:ksni"]
+
+[dependencies]
+libc = "0.2.186"
+ksni = { version = "0.3.6", features = ["blocking"], optional = true }
+
+[[bin]]
+name = "inzone-buds-tray"
+path = "src/bin/inzone-buds-tray.rs"
+required-features = ["tray"]
+
+[profile.release]
+lto = true
+strip = true
