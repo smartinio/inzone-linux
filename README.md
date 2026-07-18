@@ -85,8 +85,9 @@ Start the StatusNotifierItem tray application with:
 Clicking the headphone icon opens a menu with the separately reported left,
 right, and case percentages. The menu also provides Refresh and Quit actions.
 Battery reads run outside the D-Bus menu thread so an unavailable receiver does
-not freeze Plasma's tray UI. It queries once at startup and then only when you
-click Refresh; it does not poll the receiver continuously in the background.
+not freeze Plasma's tray UI. It queries once at startup, automatically refreshes
+once a minute, and also lets you request an immediate refresh. Automatic and
+manual requests share one worker and cannot run concurrently.
 
 To install both binaries into Cargo's user binary directory:
 

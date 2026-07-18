@@ -7,6 +7,8 @@ use ksni::blocking::TrayMethods;
 use ksni::menu::StandardItem;
 use ksni::{Category, MenuItem, Status, ToolTip, Tray};
 
+const AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
 #[derive(Debug)]
 enum ReadingStatus {
     Loading,
@@ -138,6 +140,13 @@ fn read_batteries() -> Result<BatteryReading, String> {
         .map_err(|error| error.to_string())
 }
 
+fn wait_for_refresh(receiver: &mpsc::Receiver<()>, interval: Duration) -> bool {
+    matches!(
+        receiver.recv_timeout(interval),
+        Ok(()) | Err(mpsc::RecvTimeoutError::Timeout)
+    )
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (refresh_sender, refresh_receiver) = mpsc::sync_channel(1);
     let (quit_sender, quit_receiver) = mpsc::channel();
@@ -150,7 +159,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let update_handle = handle.clone();
     thread::spawn(move || {
-        while refresh_receiver.recv().is_ok() {
+        while wait_for_refresh(&refresh_receiver, AUTO_REFRESH_INTERVAL) {
             let result = read_batteries();
             if update_handle
                 .update(move |tray| {
@@ -176,4 +185,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     handle.shutdown().wait();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refreshes_for_manual_requests_and_timer_expiry() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        sender.try_send(()).unwrap();
+        assert!(wait_for_refresh(&receiver, Duration::from_secs(1)));
+        assert!(wait_for_refresh(&receiver, Duration::ZERO));
+    }
+
+    #[test]
+    fn stops_refreshing_when_all_senders_are_gone() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        drop(sender);
+        assert!(!wait_for_refresh(&receiver, Duration::ZERO));
+    }
 }
