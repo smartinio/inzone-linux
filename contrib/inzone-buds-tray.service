@@ -1,0 +1,13 @@
+[Unit]
+Description=Sony INZONE Buds battery tray
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/inzone-buds-tray
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=graphical-session.target

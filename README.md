@@ -94,13 +94,21 @@ To install both binaries into Cargo's user binary directory:
 cargo install --locked --path . --features tray
 ```
 
-To start it automatically after installing the binary in your `PATH`, copy the
-included desktop entry:
+To run the tray as a user service after graphical login, install and enable the
+included systemd unit:
 
 ```bash
-mkdir -p ~/.config/autostart
-cp contrib/inzone-buds-tray.desktop ~/.config/autostart/
+install -Dm755 target/release/inzone-buds-tray ~/.local/bin/inzone-buds-tray
+install -Dm644 contrib/inzone-buds-tray.service \
+  ~/.config/systemd/user/inzone-buds-tray.service
+systemctl --user daemon-reload
+systemctl --user enable --now inzone-buds-tray.service
 ```
+
+The service starts with `graphical-session.target`, stops at logout, and
+restarts after failures. Choosing Quit from the tray is a clean exit and does
+not trigger a restart. The included `inzone-buds-tray.desktop` remains
+available as an XDG-autostart fallback on desktops without systemd user units.
 
 ## Roadmap
 
