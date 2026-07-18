@@ -172,14 +172,33 @@ pub struct QueryResult {
 }
 
 pub fn discover_device() -> Result<PathBuf, Error> {
-    let entries = fs::read_dir("/sys/class/hidraw")
-        .map_err(|source| io_error("read /sys/class/hidraw", source))?;
+    discover_device_in(Path::new("/sys/class/hidraw"), Path::new("/dev"))
+}
+
+fn discover_device_in(class_root: &Path, device_root: &Path) -> Result<PathBuf, Error> {
+    let entries = match fs::read_dir(class_root) {
+        Ok(entries) => entries,
+        Err(source) => return Err(io_error("read hidraw class", source)),
+    };
+    let mut paths = entries.map(|entry| entry.map(|entry| entry.path()));
+    discover_device_paths(&mut paths, device_root)
+}
+
+fn discover_device_paths(
+    paths: &mut dyn Iterator<Item = io::Result<PathBuf>>,
+    device_root: &Path,
+) -> Result<PathBuf, Error> {
     let mut matches = Vec::new();
 
-    for entry in entries {
-        let entry = entry.map_err(|source| io_error("inspect /sys/class/hidraw", source))?;
-        if matches_expected_interface(&entry.path()) {
-            matches.push(PathBuf::from("/dev").join(entry.file_name()));
+    for path in paths {
+        let path = match path {
+            Ok(path) => path,
+            Err(source) => return Err(io_error("inspect hidraw class", source)),
+        };
+        if matches_expected_interface(&path) {
+            if let Some(name) = path.file_name() {
+                matches.push(device_root.join(name));
+            }
         }
     }
 
@@ -215,7 +234,7 @@ fn matches_expected_interface(sysfs_node: &Path) -> bool {
             .any(|window| window == EXPECTED_REPORT_COLLECTION)
 }
 
-fn validate_device_path(path: &Path) -> Result<&str, Error> {
+fn validate_device_path_in<'a>(path: &'a Path, device_root: &Path) -> Result<&'a str, Error> {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return Err(Error::DeviceMismatch(path.to_path_buf()));
     };
@@ -224,7 +243,7 @@ fn validate_device_path(path: &Path) -> Result<&str, Error> {
     };
     if suffix.is_empty()
         || !suffix.bytes().all(|byte| byte.is_ascii_digit())
-        || path != Path::new("/dev").join(name)
+        || path != device_root.join(name)
     {
         return Err(Error::DeviceMismatch(path.to_path_buf()));
     }
@@ -240,25 +259,63 @@ fn linux_device_minor(device: u64) -> u64 {
 }
 
 fn open_verified_device(path: &Path) -> Result<File, Error> {
-    validate_device_path(path)?;
+    open_verified_device_with(
+        path,
+        Path::new("/dev"),
+        Path::new("/sys/dev/char"),
+        open_hid_device,
+    )
+}
 
-    let device = OpenOptions::new()
+fn open_hid_device(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
         .read(true)
         .write(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
-        .map_err(|source| io_error("open HID device for reading and battery queries", source))?;
+}
 
-    let metadata = device
-        .metadata()
-        .map_err(|source| io_error("inspect opened HID device", source))?;
+fn open_verified_device_with<F>(
+    path: &Path,
+    device_root: &Path,
+    sys_char_root: &Path,
+    opener: F,
+) -> Result<File, Error>
+where
+    F: FnOnce(&Path) -> io::Result<File>,
+{
+    validate_device_path_in(path, device_root)?;
+    let device = match opener(path) {
+        Ok(device) => device,
+        Err(source) => {
+            return Err(io_error(
+                "open HID device for reading and battery queries",
+                source,
+            ));
+        }
+    };
+
+    let metadata = device.metadata();
+    inspect_opened_device(path, sys_char_root, device, metadata)
+}
+
+fn inspect_opened_device(
+    path: &Path,
+    sys_char_root: &Path,
+    device: File,
+    metadata: io::Result<fs::Metadata>,
+) -> Result<File, Error> {
+    let metadata = match metadata {
+        Ok(metadata) => metadata,
+        Err(source) => return Err(io_error("inspect opened HID device", source)),
+    };
     if !metadata.file_type().is_char_device() {
         return Err(Error::DeviceMismatch(path.to_path_buf()));
     }
 
     let device_number = metadata.rdev();
-    let sysfs_node = PathBuf::from(format!(
-        "/sys/dev/char/{}:{}",
+    let sysfs_node = sys_char_root.join(format!(
+        "{}:{}",
         linux_device_major(device_number),
         linux_device_minor(device_number)
     ));
@@ -354,11 +411,6 @@ pub fn parse_battery_response(
     }
 
     let params = &frame[11..frame.len() - 1];
-    if params.len() != 6 {
-        return Err(Error::InvalidResponse(
-            "battery payload is not exactly six bytes".into(),
-        ));
-    }
 
     Ok(BatteryReading {
         left: BatteryCell::from_bytes(params[0], params[1]),
@@ -368,9 +420,30 @@ pub fn parse_battery_response(
 }
 
 pub fn query_battery(path: &Path, timeout: Duration) -> Result<QueryResult, Error> {
-    let mut device = open_verified_device(path)?;
-    let started = Instant::now();
+    query_battery_with(path, timeout, open_verified_device)
+}
+
+fn query_battery_with<D, F>(path: &Path, timeout: Duration, opener: F) -> Result<QueryResult, Error>
+where
+    D: Read + Write,
+    F: FnOnce(&Path) -> Result<D, Error>,
+{
     let transaction = NEXT_TRANSACTION.fetch_add(1, Ordering::Relaxed);
+    query_battery_with_transaction(path, timeout, transaction, opener)
+}
+
+fn query_battery_with_transaction<D, F>(
+    path: &Path,
+    timeout: Duration,
+    transaction: u16,
+    opener: F,
+) -> Result<QueryResult, Error>
+where
+    D: Read + Write,
+    F: FnOnce(&Path) -> Result<D, Error>,
+{
+    let mut device = opener(path)?;
+    let started = Instant::now();
     write_request(&mut device, &battery_request(transaction), started, timeout)?;
     let (reading, response) = read_response(&mut device, transaction, started, timeout)?;
     Ok(QueryResult {
@@ -384,9 +457,6 @@ fn pause_until_retry(started: Instant, timeout: Duration) -> Result<(), Error> {
     let Some(remaining) = timeout.checked_sub(elapsed) else {
         return Err(Error::Timeout(timeout));
     };
-    if remaining.is_zero() {
-        return Err(Error::Timeout(timeout));
-    }
     thread::sleep(RETRY_INTERVAL.min(remaining));
     Ok(())
 }
@@ -400,7 +470,7 @@ fn ensure_before_deadline(started: Instant, timeout: Duration) -> Result<(), Err
 }
 
 fn write_request(
-    device: &mut File,
+    device: &mut dyn Write,
     request: &[u8; REPORT_SIZE],
     started: Instant,
     timeout: Duration,
@@ -441,7 +511,7 @@ fn looks_like_matching_battery_event(response: &[u8], transaction: u16) -> bool 
 }
 
 fn read_response(
-    device: &mut File,
+    device: &mut dyn Read,
     transaction: u16,
     started: Instant,
     timeout: Duration,
@@ -480,6 +550,10 @@ fn read_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::error::Error as _;
+    use std::os::unix::fs::symlink;
+    use std::sync::atomic::AtomicUsize;
 
     const CAPTURED_RESPONSE: [u8; 64] = [
         0x02, 0x12, 0x04, 0xff, 0x0f, 0x00, 0x96, 0xc3, 0x14, 0x04, 0x10, 0x01, 0x00, 0x00, 0x36,
@@ -488,6 +562,115 @@ mod tests {
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00,
     ];
+
+    static TEMP_ID: AtomicUsize = AtomicUsize::new(0);
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            let id = TEMP_ID.fetch_add(1, Ordering::Relaxed);
+            let path =
+                std::env::temp_dir().join(format!("inzone-buds-test-{}-{id}", std::process::id()));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    fn write_interface(node: &Path, uevent: &str, interface: &str, descriptor: &[u8]) {
+        fs::create_dir_all(node.join("device")).unwrap();
+        fs::write(node.join("device/uevent"), uevent).unwrap();
+        fs::write(node.join("bInterfaceNumber"), interface).unwrap();
+        fs::write(node.join("device/report_descriptor"), descriptor).unwrap();
+    }
+
+    fn valid_descriptor() -> Vec<u8> {
+        let mut descriptor = vec![0xaa, 0xbb];
+        descriptor.extend_from_slice(EXPECTED_REPORT_COLLECTION);
+        descriptor.push(0xcc);
+        descriptor
+    }
+
+    fn response_for(transaction: u16) -> [u8; 64] {
+        let mut response = CAPTURED_RESPONSE;
+        response[11..13].copy_from_slice(&transaction.to_le_bytes());
+        fix_checksum(&mut response);
+        response
+    }
+
+    fn fix_checksum(response: &mut [u8; 64]) {
+        response[19] = response[5..19]
+            .iter()
+            .fold(0_u8, |sum, byte| sum.wrapping_add(*byte));
+    }
+
+    enum IoAction {
+        Data(Vec<u8>),
+        Length(usize),
+        Error(io::ErrorKind),
+    }
+
+    struct ScriptedDevice {
+        reads: VecDeque<IoAction>,
+        writes: VecDeque<IoAction>,
+        written: Vec<u8>,
+    }
+
+    impl ScriptedDevice {
+        fn new(reads: Vec<IoAction>, writes: Vec<IoAction>) -> Self {
+            Self {
+                reads: reads.into(),
+                writes: writes.into(),
+                written: Vec::new(),
+            }
+        }
+    }
+
+    impl Read for ScriptedDevice {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            match self.reads.pop_front().unwrap_or(IoAction::Length(0)) {
+                IoAction::Data(data) => {
+                    let length = data.len().min(buffer.len());
+                    buffer[..length].copy_from_slice(&data[..length]);
+                    Ok(length)
+                }
+                IoAction::Length(length) => Ok(length),
+                IoAction::Error(kind) => Err(io::Error::from(kind)),
+            }
+        }
+    }
+
+    impl Write for ScriptedDevice {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            match self
+                .writes
+                .pop_front()
+                .unwrap_or(IoAction::Length(buffer.len()))
+            {
+                IoAction::Length(length) => {
+                    self.written
+                        .extend_from_slice(&buffer[..length.min(buffer.len())]);
+                    Ok(length)
+                }
+                IoAction::Error(kind) => Err(io::Error::from(kind)),
+                IoAction::Data(data) => {
+                    let length = data.len().min(buffer.len());
+                    self.written.extend_from_slice(&buffer[..length]);
+                    Ok(length)
+                }
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn creates_known_battery_request() {
@@ -542,15 +725,442 @@ mod tests {
 
     #[test]
     fn rejects_paths_not_bound_to_dev_hidraw() {
-        assert!(validate_device_path(Path::new("/dev/hidraw3")).is_ok());
-        assert!(validate_device_path(Path::new("/tmp/hidraw3")).is_err());
-        assert!(validate_device_path(Path::new("/dev/hidrawx")).is_err());
-        assert!(validate_device_path(Path::new("/dev/hidraw3/../hidraw3")).is_err());
+        let root = Path::new("/dev");
+        assert!(validate_device_path_in(Path::new("/dev/hidraw3"), root).is_ok());
+        assert!(validate_device_path_in(Path::new("/"), root).is_err());
+        assert!(validate_device_path_in(Path::new("/dev/nope"), root).is_err());
+        assert!(validate_device_path_in(Path::new("/tmp/hidraw3"), root).is_err());
+        assert!(validate_device_path_in(Path::new("/dev/hidrawx"), root).is_err());
+        assert!(validate_device_path_in(Path::new("/dev/hidraw3/../hidraw3"), root).is_err());
     }
 
     #[test]
     fn decodes_linux_device_numbers() {
         assert_eq!(linux_device_major(0xf303), 243);
         assert_eq!(linux_device_minor(0xf303), 3);
+    }
+
+    #[test]
+    fn formats_all_public_states_and_errors() {
+        let states = [
+            (0, BatteryState::Discharging, "discharging"),
+            (1, BatteryState::Charging, "charging"),
+            (2, BatteryState::Error, "error"),
+            (0xff, BatteryState::Unavailable, "unavailable"),
+        ];
+        for (raw, state, text) in states {
+            assert_eq!(BatteryState::from_byte(raw), state);
+            assert_eq!(state.as_str(), text);
+            assert_eq!(state.to_string(), text);
+        }
+        let unknown = BatteryState::from_byte(7);
+        assert_eq!(unknown, BatteryState::Unknown(7));
+        assert_eq!(unknown.as_str(), "unknown");
+        assert_eq!(unknown.to_string(), "unknown (0x07)");
+
+        assert_eq!(BatteryCell::from_bytes(1, 42).to_string(), "42% (charging)");
+        assert_eq!(
+            BatteryCell::from_bytes(2, 101).to_string(),
+            "unknown (error)"
+        );
+
+        let paths = vec![PathBuf::from("/dev/hidraw2"), PathBuf::from("/dev/hidraw3")];
+        let errors = [
+            Error::DeviceNotFound.to_string(),
+            Error::AmbiguousDevices(paths).to_string(),
+            Error::DeviceMismatch(PathBuf::from("/tmp/nope")).to_string(),
+            Error::Timeout(Duration::from_secs(2)).to_string(),
+            Error::InvalidResponse("bad".into()).to_string(),
+        ];
+        assert!(errors[0].contains("054c:0ec2"));
+        assert!(errors[1].contains("hidraw2, /dev/hidraw3"));
+        assert!(errors[2].contains("/tmp/nope"));
+        assert!(errors[3].contains("2 seconds"));
+        assert!(errors[4].contains("bad"));
+
+        let source = io::Error::new(io::ErrorKind::PermissionDenied, "denied");
+        let error = io_error("open", source);
+        assert_eq!(error.to_string(), "open: denied");
+        assert_eq!(error.source().unwrap().to_string(), "denied");
+        assert!(Error::DeviceNotFound.source().is_none());
+    }
+
+    #[test]
+    fn discovers_only_exact_interfaces_and_fails_closed() {
+        let temp = TestDir::new();
+        let class = temp.0.join("class");
+        let devices = temp.0.join("dev");
+        fs::create_dir_all(&class).unwrap();
+
+        assert!(matches!(
+            discover_device_in(&temp.0.join("missing"), &devices),
+            Err(Error::Io { .. })
+        ));
+        assert!(matches!(
+            discover_device_in(&class, &devices),
+            Err(Error::DeviceNotFound)
+        ));
+
+        let node = class.join("hidraw9");
+        write_interface(
+            &node,
+            "HID_ID=0003:0000054C:00000EC2\n",
+            "05\n",
+            &valid_descriptor(),
+        );
+        assert_eq!(
+            discover_device_in(&class, &devices).unwrap(),
+            devices.join("hidraw9")
+        );
+
+        let second = class.join("hidraw10");
+        write_interface(
+            &second,
+            "hid_id=0003:0000054c:00000ec2\n",
+            "05",
+            &valid_descriptor(),
+        );
+        let error = discover_device_in(&class, &devices).unwrap_err();
+        assert!(matches!(error, Error::AmbiguousDevices(_)));
+
+        let mut broken = vec![Err(io::Error::from(io::ErrorKind::Other))].into_iter();
+        assert!(matches!(
+            discover_device_paths(&mut broken, &devices),
+            Err(Error::Io { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_incomplete_or_wrong_sysfs_interfaces() {
+        let temp = TestDir::new();
+        let node = temp.0.join("hidraw0");
+        assert!(!matches_expected_interface(&node));
+
+        fs::create_dir_all(node.join("device")).unwrap();
+        fs::write(
+            node.join("device/uevent"),
+            "HID_ID=0003:0000054C:00000EC2\n",
+        )
+        .unwrap();
+        assert!(!matches_expected_interface(&node));
+        fs::write(node.join("bInterfaceNumber"), "05").unwrap();
+        assert!(!matches_expected_interface(&node));
+        fs::write(node.join("device/report_descriptor"), valid_descriptor()).unwrap();
+        assert!(matches_expected_interface(&node));
+
+        fs::write(
+            node.join("device/uevent"),
+            "HID_ID=0003:00000001:00000002\n",
+        )
+        .unwrap();
+        assert!(!matches_expected_interface(&node));
+        fs::write(
+            node.join("device/uevent"),
+            "HID_ID=0003:0000054C:00000EC2\n",
+        )
+        .unwrap();
+        fs::write(node.join("bInterfaceNumber"), "xx").unwrap();
+        assert!(!matches_expected_interface(&node));
+        fs::write(node.join("bInterfaceNumber"), "04").unwrap();
+        assert!(!matches_expected_interface(&node));
+        fs::write(node.join("bInterfaceNumber"), "05").unwrap();
+        fs::write(node.join("device/report_descriptor"), [1, 2, 3]).unwrap();
+        assert!(!matches_expected_interface(&node));
+        assert!(!is_inzone_uevent(""));
+    }
+
+    #[test]
+    fn validates_the_exact_opened_character_device() {
+        let temp = TestDir::new();
+        let device_root = temp.0.join("dev");
+        let sys_root = temp.0.join("sys");
+        let path = device_root.join("hidraw7");
+        fs::create_dir_all(&device_root).unwrap();
+
+        let denied = open_verified_device_with(&path, &device_root, &sys_root, |_| {
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        })
+        .unwrap_err();
+        assert!(matches!(denied, Error::Io { .. }));
+
+        let regular = temp.0.join("regular");
+        fs::write(&regular, b"data").unwrap();
+        let mismatch =
+            open_verified_device_with(&path, &device_root, &sys_root, |_| File::open(&regular))
+                .unwrap_err();
+        assert!(matches!(mismatch, Error::DeviceMismatch(_)));
+
+        let null = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/null")
+            .unwrap();
+        let rdev = null.metadata().unwrap().rdev();
+        let node = sys_root.join(format!(
+            "{}:{}",
+            linux_device_major(rdev),
+            linux_device_minor(rdev)
+        ));
+        write_interface(
+            &node,
+            "HID_ID=0003:0000054C:00000EC2\n",
+            "05",
+            &valid_descriptor(),
+        );
+        let opened = open_verified_device_with(&path, &device_root, &sys_root, |_| {
+            OpenOptions::new().read(true).write(true).open("/dev/null")
+        })
+        .unwrap();
+        assert!(opened.metadata().unwrap().file_type().is_char_device());
+
+        fs::write(node.join("bInterfaceNumber"), "04").unwrap();
+        let mismatch = open_verified_device_with(&path, &device_root, &sys_root, |_| {
+            OpenOptions::new().read(true).write(true).open("/dev/null")
+        })
+        .unwrap_err();
+        assert!(matches!(mismatch, Error::DeviceMismatch(_)));
+
+        let regular = File::open(&regular).unwrap();
+        assert!(matches!(
+            inspect_opened_device(
+                &path,
+                &sys_root,
+                regular,
+                Err(io::Error::from(io::ErrorKind::Other))
+            ),
+            Err(Error::Io { .. })
+        ));
+
+        let target = temp.0.join("target");
+        let link = temp.0.join("link");
+        fs::write(&target, b"data").unwrap();
+        symlink(&target, &link).unwrap();
+        assert_eq!(
+            open_hid_device(&link).unwrap_err().raw_os_error(),
+            Some(libc::ELOOP)
+        );
+    }
+
+    #[test]
+    fn parses_every_rejected_response_header() {
+        let cases: Vec<Vec<u8>> = vec![
+            vec![],
+            vec![REPORT_ID],
+            {
+                let mut value = CAPTURED_RESPONSE;
+                value[0] = 9;
+                value.to_vec()
+            },
+            {
+                let mut value = CAPTURED_RESPONSE;
+                value[1] = 17;
+                value.to_vec()
+            },
+            CAPTURED_RESPONSE[..19].to_vec(),
+        ];
+        for case in cases {
+            assert!(parse_battery_response(&case, 1).is_err());
+        }
+
+        for (offset, value) in [(2, 3), (3, 0), (4, 14), (5, 1)] {
+            let mut response = CAPTURED_RESPONSE;
+            response[offset] = value;
+            fix_checksum(&mut response);
+            assert!(
+                parse_battery_response(&response, 1)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("event header")
+            );
+        }
+        for (offset, value) in [(6, 0), (7, 0)] {
+            let mut response = CAPTURED_RESPONSE;
+            response[offset] = value;
+            fix_checksum(&mut response);
+            assert!(
+                parse_battery_response(&response, 1)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Sony key")
+            );
+        }
+        for (offset, value) in [(8, 0), (9, 0), (10, 0)] {
+            let mut response = CAPTURED_RESPONSE;
+            response[offset] = value;
+            fix_checksum(&mut response);
+            assert!(
+                parse_battery_response(&response, 1)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("battery return event")
+            );
+        }
+    }
+
+    #[test]
+    fn recognizes_only_the_matching_battery_event_shape() {
+        assert!(looks_like_matching_battery_event(&CAPTURED_RESPONSE, 1));
+        assert!(!looks_like_matching_battery_event(
+            &CAPTURED_RESPONSE[..12],
+            1
+        ));
+        for (offset, value) in [
+            (0, 0),
+            (2, 0),
+            (3, 0),
+            (6, 0),
+            (7, 0),
+            (8, 0),
+            (9, 0),
+            (10, 0),
+            (11, 2),
+        ] {
+            let mut response = CAPTURED_RESPONSE;
+            response[offset] = value;
+            assert!(!looks_like_matching_battery_event(&response, 1));
+        }
+    }
+
+    #[test]
+    fn queries_through_a_scripted_transport() {
+        let response = response_for(77);
+        let result = query_battery_with_transaction(
+            Path::new("/ignored"),
+            Duration::from_secs(1),
+            77,
+            |_| {
+                Ok(ScriptedDevice::new(
+                    vec![IoAction::Data(response.to_vec())],
+                    vec![],
+                ))
+            },
+        )
+        .unwrap();
+        assert_eq!(result.reading.left.percent, Some(54));
+        assert_eq!(result.raw_response, response[..20]);
+
+        let error = query_battery_with::<ScriptedDevice, _>(
+            Path::new("/ignored"),
+            Duration::from_secs(1),
+            |_| Err(Error::DeviceNotFound),
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::DeviceNotFound));
+        assert!(query_battery(Path::new("/tmp/hidraw3"), Duration::ZERO).is_err());
+    }
+
+    #[test]
+    fn handles_every_write_outcome() {
+        let request = battery_request(1);
+        let mut interrupted = ScriptedDevice::new(
+            vec![],
+            vec![
+                IoAction::Error(io::ErrorKind::Interrupted),
+                IoAction::Length(64),
+            ],
+        );
+        write_request(
+            &mut interrupted,
+            &request,
+            Instant::now(),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        interrupted.flush().unwrap();
+        assert_eq!(interrupted.written, request);
+
+        let mut data_action = ScriptedDevice::new(vec![], vec![IoAction::Data(vec![0; 64])]);
+        write_request(
+            &mut data_action,
+            &request,
+            Instant::now(),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+
+        let mut short = ScriptedDevice::new(vec![], vec![IoAction::Length(3)]);
+        assert!(
+            write_request(&mut short, &request, Instant::now(), Duration::from_secs(1)).is_err()
+        );
+
+        let mut failed =
+            ScriptedDevice::new(vec![], vec![IoAction::Error(io::ErrorKind::BrokenPipe)]);
+        assert!(
+            write_request(
+                &mut failed,
+                &request,
+                Instant::now(),
+                Duration::from_secs(1)
+            )
+            .is_err()
+        );
+
+        let mut blocked =
+            ScriptedDevice::new(vec![], vec![IoAction::Error(io::ErrorKind::WouldBlock)]);
+        assert!(
+            write_request(
+                &mut blocked,
+                &request,
+                Instant::now(),
+                Duration::from_millis(1)
+            )
+            .is_err()
+        );
+        let mut unused = ScriptedDevice::new(vec![], vec![]);
+        assert!(write_request(&mut unused, &request, Instant::now(), Duration::ZERO).is_err());
+    }
+
+    #[test]
+    fn handles_every_read_outcome() {
+        let valid = response_for(9);
+        let unrelated = vec![0; 64];
+        let mut device = ScriptedDevice::new(
+            vec![
+                IoAction::Error(io::ErrorKind::Interrupted),
+                IoAction::Data(unrelated),
+                IoAction::Data(valid.to_vec()),
+            ],
+            vec![],
+        );
+        let (reading, raw) =
+            read_response(&mut device, 9, Instant::now(), Duration::from_secs(1)).unwrap();
+        assert_eq!(reading.right.percent, Some(56));
+        assert_eq!(raw.len(), 20);
+
+        let mut malformed = valid;
+        malformed[19] ^= 1;
+        let mut device = ScriptedDevice::new(vec![IoAction::Data(malformed.to_vec())], vec![]);
+        assert!(read_response(&mut device, 9, Instant::now(), Duration::from_secs(1)).is_err());
+
+        for action in [
+            IoAction::Length(0),
+            IoAction::Error(io::ErrorKind::BrokenPipe),
+            IoAction::Error(io::ErrorKind::WouldBlock),
+        ] {
+            let timeout = if matches!(action, IoAction::Error(io::ErrorKind::WouldBlock)) {
+                Duration::from_millis(1)
+            } else {
+                Duration::from_secs(1)
+            };
+            let mut device = ScriptedDevice::new(vec![action], vec![]);
+            assert!(read_response(&mut device, 9, Instant::now(), timeout).is_err());
+        }
+        let mut device = ScriptedDevice::new(vec![], vec![]);
+        assert!(read_response(&mut device, 9, Instant::now(), Duration::ZERO).is_err());
+    }
+
+    #[test]
+    fn deadline_helpers_cover_wait_and_expiry() {
+        let started = Instant::now();
+        pause_until_retry(started, Duration::from_millis(20)).unwrap();
+        assert!(ensure_before_deadline(started, Duration::from_secs(1)).is_ok());
+        assert!(pause_until_retry(started, Duration::ZERO).is_err());
+        assert!(ensure_before_deadline(started, Duration::ZERO).is_err());
+    }
+
+    #[test]
+    fn production_adapters_fail_safely_without_opening_a_device() {
+        let _ = discover_device();
+        assert!(open_verified_device(Path::new("/tmp/inzone-buds-coverage-no-device")).is_err());
     }
 }

@@ -11,7 +11,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4.2.2
       - name: Install Rust stable
         run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
       - name: Check formatting
@@ -24,3 +24,23 @@ jobs:
         run: |
           rustup toolchain install 1.85.0 --profile minimal
           cargo +1.85.0 test --all-targets --all-features --locked
+
+  coverage:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - name: Install tray test runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes dbus-daemon
+      - name: Install Rust coverage tools
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal --component llvm-tools-preview
+          cargo +1.97.1 install cargo-llvm-cov --version 0.8.6 --locked
+      - name: Require zero uncovered source lines and functions
+        run: |
+          cargo +1.97.1 llvm-cov --all-features --all-targets --workspace --locked \
+            --no-default-ignore-filename-regex \
+            --fail-uncovered-lines 0 \
+            --fail-uncovered-functions 0 \
+            --show-missing-lines
