@@ -150,8 +150,10 @@ impl BatteryCell {
 impl fmt::Display for BatteryCell {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match (self.percent, self.state) {
-            // The receiver reports a useful case percentage while its state byte is 0xff.
-            (Some(percent), BatteryState::Unavailable) => write!(f, "{percent}%"),
+            // The receiver retains a case snapshot while the case is out of radio contact.
+            (Some(percent), BatteryState::Unavailable) => {
+                write!(f, "{percent}% (last reported)")
+            }
             (Some(percent), state) => write!(f, "{percent}% ({state})"),
             (None, state) => write!(f, "unknown ({state})"),
         }

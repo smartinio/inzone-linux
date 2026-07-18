@@ -12,7 +12,7 @@ fn reading() -> BatteryReading {
             state: BatteryState::Charging,
         },
         case: BatteryCell {
-            percent: None,
+            percent: Some(38),
             state: BatteryState::Unavailable,
         },
     }
@@ -79,13 +79,17 @@ fn exposes_every_tray_state_and_property() {
     assert_eq!(loading.menu().len(), 4);
 
     let (ready, _, _) = tray(ReadingStatus::Ready(reading()));
-    assert_eq!(ready.summary(), "Left 40% · Right 50% · Case unknown");
+    assert_eq!(ready.summary(), "Left 40% · Right 50%");
     assert!(matches!(ready.status(), Status::Active));
-    let menu = ready.menu();
+    let mut menu = ready.menu();
     assert_eq!(menu.len(), 6);
     assert_eq!(
-        standard(menu.into_iter().next().unwrap()).unwrap().label,
+        standard(menu.remove(0)).unwrap().label,
         "Left:  40% (discharging)"
+    );
+    assert_eq!(
+        standard(menu.remove(1)).unwrap().label,
+        "Case:  38% (last reported)"
     );
 
     let (failed, _, _) = tray(ReadingStatus::Error("offline".into()));

@@ -82,8 +82,10 @@ Start the StatusNotifierItem tray application with:
 ./target/release/inzone-buds-tray
 ```
 
-Clicking the headphone icon opens a menu with the separately reported left,
-right, and case percentages. The menu also provides Refresh and Quit actions.
+Clicking the headphone icon opens a menu with live left and right percentages
+plus the case's explicitly labelled last-reported value. The live tray summary
+omits the case because it cannot update while the earbuds are outside it. The
+menu also provides Refresh and Quit actions.
 Battery reads run outside the D-Bus menu thread so an unavailable receiver does
 not freeze Plasma's tray UI. It queries once at startup, automatically refreshes
 once a minute, and also lets you request an immediate refresh. Automatic and

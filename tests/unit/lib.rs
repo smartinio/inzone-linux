@@ -150,7 +150,7 @@ fn parses_captured_battery_response() {
     assert_eq!(reading.right.state, BatteryState::Discharging);
     assert_eq!(reading.case.percent, Some(90));
     assert_eq!(reading.case.state, BatteryState::Unavailable);
-    assert_eq!(reading.case.to_string(), "90%");
+    assert_eq!(reading.case.to_string(), "90% (last reported)");
 }
 
 #[test]

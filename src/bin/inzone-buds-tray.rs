@@ -29,10 +29,9 @@ impl InzoneTray {
         match &self.status {
             ReadingStatus::Loading => "Reading battery status…".into(),
             ReadingStatus::Ready(reading) => format!(
-                "Left {} · Right {} · Case {}",
+                "Left {} · Right {}",
                 short_cell(reading.left),
-                short_cell(reading.right),
-                short_cell(reading.case)
+                short_cell(reading.right)
             ),
             ReadingStatus::Error(error) => error.clone(),
         }

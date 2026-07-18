@@ -58,6 +58,11 @@ through the final payload byte. The final byte of the frame contains that sum.
 The current parser requires the verified 18-byte frame shape and retains only
 its meaningful bytes for diagnostic output.
 
+The case has no live radio path to the USB receiver while the earbuds are out
+of it. A case percentage accompanied by state `0xff` is therefore a retained
+snapshot from the last exchange through the earbuds, not a live reading. The
+case may charge independently without that value changing.
+
 ## Deliberate scope
 
 The wider protocol exposes settings and firmware operations. This project does
