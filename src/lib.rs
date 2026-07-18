@@ -195,11 +195,7 @@ fn discover_device_paths(
             Ok(path) => path,
             Err(source) => return Err(io_error("inspect hidraw class", source)),
         };
-        if matches_expected_interface(&path) {
-            if let Some(name) = path.file_name() {
-                matches.push(device_root.join(name));
-            }
-        }
+        matches.extend(matching_device_path(&path, device_root));
     }
 
     matches.sort();
@@ -208,6 +204,13 @@ fn discover_device_paths(
         1 => Ok(matches.remove(0)),
         _ => Err(Error::AmbiguousDevices(matches)),
     }
+}
+
+fn matching_device_path(path: &Path, device_root: &Path) -> Option<PathBuf> {
+    if !matches_expected_interface(path) {
+        return None;
+    }
+    path.file_name().map(|name| device_root.join(name))
 }
 
 fn is_inzone_uevent(uevent: &str) -> bool {
