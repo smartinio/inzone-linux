@@ -1,14 +1,40 @@
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{env, ffi::OsString, path::PathBuf};
 
 use inzone_buds::{BatteryCell, BatteryReading, DEFAULT_TIMEOUT, discover_device, query_battery};
 use ksni::blocking::TrayMethods;
 use ksni::menu::StandardItem;
-use ksni::{Category, MenuItem, Status, ToolTip, Tray};
+use ksni::{Category, Icon, MenuItem, Status, ToolTip, Tray};
 
 const AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+const HOVER_REFRESH_COOLDOWN: Duration = Duration::from_secs(1);
+const DIMMED_ICON_SIZE: i32 = 22;
+const DIMMED_ICON_OPACITY: u8 = 102;
+const HEADPHONES_MASK: &[u8; (DIMMED_ICON_SIZE * DIMMED_ICON_SIZE) as usize] = b"\
+......................\
+......................\
+........######........\
+......##########......\
+.....###......###.....\
+....##..........##....\
+...##............##...\
+...##............##...\
+..##..............##..\
+..##..............##..\
+.####............####.\
+.####............####.\
+.####............####.\
+.####............####.\
+.####............####.\
+..###............###..\
+...##............##...\
+......................\
+......................\
+......................\
+......................\
+......................";
 
 #[derive(Debug)]
 enum ReadingStatus {
@@ -21,6 +47,7 @@ enum ReadingStatus {
 struct InzoneTray {
     status: ReadingStatus,
     refresh_sender: mpsc::SyncSender<()>,
+    last_refresh_activity: Arc<Mutex<Instant>>,
     quit_sender: mpsc::Sender<()>,
 }
 
@@ -36,6 +63,33 @@ impl InzoneTray {
             ReadingStatus::Error(error) => error.clone(),
         }
     }
+
+    fn request_refresh(&self, minimum_age: Duration) -> bool {
+        if matches!(&self.status, ReadingStatus::Loading) {
+            return false;
+        }
+
+        let mut last_activity = self
+            .last_refresh_activity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if last_activity.elapsed() < minimum_age {
+            return false;
+        }
+
+        if self.refresh_sender.try_send(()).is_ok() {
+            *last_activity = Instant::now();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn begin_refresh(&mut self) {
+        if self.request_refresh(Duration::ZERO) {
+            self.status = ReadingStatus::Loading;
+        }
+    }
 }
 
 impl Tray for InzoneTray {
@@ -43,6 +97,14 @@ impl Tray for InzoneTray {
 
     fn id(&self) -> String {
         "inzone-buds-linux".into()
+    }
+
+    fn activate(&mut self, _x: i32, _y: i32) {
+        self.begin_refresh();
+    }
+
+    fn secondary_activate(&mut self, _x: i32, _y: i32) {
+        self.begin_refresh();
     }
 
     fn category(&self) -> Category {
@@ -55,20 +117,38 @@ impl Tray for InzoneTray {
 
     fn status(&self) -> Status {
         match self.status {
-            ReadingStatus::Error(_) => Status::NeedsAttention,
+            // The receiver cannot reach the buds while they are in the case.
+            // Keep that expected offline state subdued instead of asking the
+            // tray host to show an animated warning.
+            ReadingStatus::Error(_) => Status::Passive,
             _ => Status::Active,
         }
     }
 
     fn icon_name(&self) -> String {
-        "audio-headphones-symbolic".into()
+        match self.status {
+            ReadingStatus::Error(_) => String::new(),
+            _ => "audio-headphones-symbolic".into(),
+        }
+    }
+
+    fn icon_pixmap(&self) -> Vec<Icon> {
+        match self.status {
+            ReadingStatus::Error(_) => vec![dimmed_icon()],
+            _ => Vec::new(),
+        }
     }
 
     fn attention_icon_name(&self) -> String {
-        "dialog-warning-symbolic".into()
+        self.icon_name()
     }
 
     fn tool_tip(&self) -> ToolTip {
+        // StatusNotifierItem has no hover event. Tray hosts fetch this property
+        // to display a tooltip, so use that access as the hover refresh signal.
+        // The cooldown also prevents ksni's own property checks from creating
+        // a self-sustaining refresh loop.
+        let _ = self.request_refresh(HOVER_REFRESH_COOLDOWN);
         ToolTip {
             icon_name: self.icon_name(),
             title: self.title(),
@@ -96,11 +176,7 @@ impl Tray for InzoneTray {
                 icon_name: "view-refresh-symbolic".into(),
                 enabled: refresh_enabled,
                 activate: Box::new(|tray: &mut Self| {
-                    if !matches!(&tray.status, ReadingStatus::Loading)
-                        && tray.refresh_sender.try_send(()).is_ok()
-                    {
-                        tray.status = ReadingStatus::Loading;
-                    }
+                    tray.begin_refresh();
                 }),
                 ..StandardItem::default()
             }
@@ -117,6 +193,12 @@ impl Tray for InzoneTray {
         ]);
         menu
     }
+
+    fn menu_about_to_show(&mut self) {
+        // With MENU_ON_ACTIVATE, the tray host opens the menu instead of
+        // invoking activate(), making this the reliable click notification.
+        self.begin_refresh();
+    }
 }
 
 fn information_item<T: Send + 'static>(label: impl Into<String>) -> MenuItem<T> {
@@ -131,6 +213,25 @@ fn information_item<T: Send + 'static>(label: impl Into<String>) -> MenuItem<T> 
 fn short_cell(cell: BatteryCell) -> String {
     cell.percent
         .map_or_else(|| "unknown".into(), |percent| format!("{percent}%"))
+}
+
+fn dimmed_icon() -> Icon {
+    let data = HEADPHONES_MASK
+        .iter()
+        .flat_map(|pixel| {
+            if *pixel == b'#' {
+                [DIMMED_ICON_OPACITY, u8::MAX, u8::MAX, u8::MAX]
+            } else {
+                [0, 0, 0, 0]
+            }
+        })
+        .collect();
+
+    Icon {
+        width: DIMMED_ICON_SIZE,
+        height: DIMMED_ICON_SIZE,
+        data,
+    }
 }
 
 fn read_batteries_with<Q>(
@@ -214,11 +315,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (refresh_sender, refresh_receiver) = mpsc::sync_channel(1);
     let (quit_sender, quit_receiver) = mpsc::channel();
     let refresh_exit_sender = quit_sender.clone();
+    let last_refresh_activity = Arc::new(Mutex::new(Instant::now()));
     let exit_after_refresh = cfg!(debug_assertions)
         && env::var("INZONE_BUDS_TRAY_TEST_EXIT_AFTER_REFRESH").as_deref() == Ok("1");
     let tray = InzoneTray {
         status: ReadingStatus::Loading,
         refresh_sender: refresh_sender.clone(),
+        last_refresh_activity: last_refresh_activity.clone(),
         quit_sender,
     };
     let handle = tray.assume_sni_available(true).spawn()?;
@@ -231,6 +334,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
         };
         let mut update = |status| {
+            *last_refresh_activity
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Instant::now();
             let updated = update_handle
                 .update(move |tray| tray.status = status)
                 .is_some();

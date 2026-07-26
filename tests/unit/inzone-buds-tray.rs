@@ -25,6 +25,7 @@ fn tray(status: ReadingStatus) -> (InzoneTray, mpsc::Receiver<()>, mpsc::Receive
         InzoneTray {
             status,
             refresh_sender,
+            last_refresh_activity: Arc::new(Mutex::new(Instant::now())),
             quit_sender,
         },
         refresh_receiver,
@@ -72,7 +73,8 @@ fn exposes_every_tray_state_and_property() {
     assert_eq!(loading.title(), "Sony INZONE Buds");
     assert!(matches!(loading.status(), Status::Active));
     assert_eq!(loading.icon_name(), "audio-headphones-symbolic");
-    assert_eq!(loading.attention_icon_name(), "dialog-warning-symbolic");
+    assert_eq!(loading.attention_icon_name(), "audio-headphones-symbolic");
+    assert!(loading.icon_pixmap().is_empty());
     let tooltip = loading.tool_tip();
     assert_eq!(tooltip.title, "Sony INZONE Buds");
     assert_eq!(tooltip.description, "Reading battery status…");
@@ -94,7 +96,26 @@ fn exposes_every_tray_state_and_property() {
 
     let (failed, _, _) = tray(ReadingStatus::Error("offline".into()));
     assert_eq!(failed.summary(), "offline");
-    assert!(matches!(failed.status(), Status::NeedsAttention));
+    assert!(matches!(failed.status(), Status::Passive));
+    assert!(failed.icon_name().is_empty());
+    assert_eq!(failed.icon_name(), failed.attention_icon_name());
+    let icons = failed.icon_pixmap();
+    assert_eq!(icons.len(), 1);
+    assert_eq!(icons[0].width, DIMMED_ICON_SIZE);
+    assert_eq!(icons[0].height, DIMMED_ICON_SIZE);
+    assert_eq!(icons[0].data.len(), (DIMMED_ICON_SIZE.pow(2) * 4) as usize);
+    assert!(
+        icons[0]
+            .data
+            .chunks_exact(4)
+            .all(|pixel| pixel[0] <= DIMMED_ICON_OPACITY)
+    );
+    assert!(
+        icons[0]
+            .data
+            .chunks_exact(4)
+            .any(|pixel| pixel == [DIMMED_ICON_OPACITY, u8::MAX, u8::MAX, u8::MAX])
+    );
     assert_eq!(
         standard(failed.menu().into_iter().next().unwrap())
             .unwrap()
@@ -143,6 +164,37 @@ fn menu_callbacks_coalesce_refresh_and_quit() {
     let mut quit_menu = ready.menu();
     let quit = standard(quit_menu.remove(5)).unwrap();
     (quit.activate)(&mut ready);
+}
+
+#[test]
+fn icon_clicks_and_hover_request_a_refresh() {
+    let (mut activated, activate_receiver, _) = tray(ReadingStatus::Ready(reading()));
+    activated.activate(10, 20);
+    assert!(matches!(activated.status, ReadingStatus::Loading));
+    activate_receiver.try_recv().unwrap();
+
+    let (mut secondary, secondary_receiver, _) = tray(ReadingStatus::Ready(reading()));
+    secondary.secondary_activate(10, 20);
+    assert!(matches!(secondary.status, ReadingStatus::Loading));
+    secondary_receiver.try_recv().unwrap();
+
+    let (mut menu_opened, menu_receiver, _) = tray(ReadingStatus::Ready(reading()));
+    menu_opened.menu_about_to_show();
+    assert!(matches!(menu_opened.status, ReadingStatus::Loading));
+    menu_receiver.try_recv().unwrap();
+
+    let (hovered, hover_receiver, _) = tray(ReadingStatus::Ready(reading()));
+    *hovered
+        .last_refresh_activity
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Instant::now() - HOVER_REFRESH_COOLDOWN;
+    assert_eq!(hovered.tool_tip().description, "Left 40% · Right 50%");
+    hover_receiver.try_recv().unwrap();
+
+    // Repeated tooltip property reads for one hover must not queue more work.
+    let _ = hovered.tool_tip();
+    assert!(hover_receiver.try_recv().is_err());
 }
 
 #[test]
