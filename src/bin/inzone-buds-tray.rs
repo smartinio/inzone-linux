@@ -8,7 +8,6 @@ use ksni::blocking::TrayMethods;
 use ksni::menu::StandardItem;
 use ksni::{Category, Icon, MenuItem, Status, ToolTip, Tray};
 
-const AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const HOVER_REFRESH_COOLDOWN: Duration = Duration::from_secs(1);
 const DIMMED_ICON_SIZE: i32 = 22;
 const DIMMED_ICON_OPACITY: u8 = 102;
@@ -38,6 +37,7 @@ const HEADPHONES_MASK: &[u8; (DIMMED_ICON_SIZE * DIMMED_ICON_SIZE) as usize] = b
 
 #[derive(Debug)]
 enum ReadingStatus {
+    Idle,
     Loading,
     Ready(BatteryReading),
     Error(String),
@@ -54,6 +54,7 @@ struct InzoneTray {
 impl InzoneTray {
     fn summary(&self) -> String {
         match &self.status {
+            ReadingStatus::Idle => "Hover, click, or refresh to read battery status".into(),
             ReadingStatus::Loading => "Reading battery status…".into(),
             ReadingStatus::Ready(reading) => format!(
                 "Left {} · Right {}",
@@ -160,6 +161,7 @@ impl Tray for InzoneTray {
     fn menu(&self) -> Vec<MenuItem<Self>> {
         let refresh_enabled = !matches!(&self.status, ReadingStatus::Loading);
         let mut menu = match &self.status {
+            ReadingStatus::Idle => vec![information_item("Battery status not read yet")],
             ReadingStatus::Loading => vec![information_item("Reading battery status…")],
             ReadingStatus::Ready(reading) => vec![
                 information_item(format!("Left:  {}", reading.left)),
@@ -264,28 +266,17 @@ fn configured_device_with(
     }
 }
 
-fn wait_for_refresh(receiver: &mpsc::Receiver<()>, interval: Duration) -> bool {
-    matches!(
-        receiver.recv_timeout(interval),
-        Ok(()) | Err(mpsc::RecvTimeoutError::Timeout)
-    )
-}
-
 fn run_refresh_loop(
     receiver: &mpsc::Receiver<()>,
-    interval: Duration,
     read: &mut dyn FnMut() -> Result<BatteryReading, String>,
     update: &mut dyn FnMut(ReadingStatus) -> bool,
 ) {
-    loop {
+    while receiver.recv().is_ok() {
         let status = match read() {
             Ok(reading) => ReadingStatus::Ready(reading),
             Err(error) => ReadingStatus::Error(error),
         };
         if !update(status) {
-            break;
-        }
-        if !wait_for_refresh(receiver, interval) {
             break;
         }
     }
@@ -315,16 +306,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (refresh_sender, refresh_receiver) = mpsc::sync_channel(1);
     let (quit_sender, quit_receiver) = mpsc::channel();
     let refresh_exit_sender = quit_sender.clone();
-    let last_refresh_activity = Arc::new(Mutex::new(Instant::now()));
+    let last_refresh_activity = Arc::new(Mutex::new(Instant::now() - HOVER_REFRESH_COOLDOWN));
     let exit_after_refresh = cfg!(debug_assertions)
         && env::var("INZONE_BUDS_TRAY_TEST_EXIT_AFTER_REFRESH").as_deref() == Ok("1");
     let tray = InzoneTray {
-        status: ReadingStatus::Loading,
+        status: ReadingStatus::Idle,
         refresh_sender: refresh_sender.clone(),
         last_refresh_activity: last_refresh_activity.clone(),
         quit_sender,
     };
     let handle = tray.assume_sni_available(true).spawn()?;
+
+    // Production reads are interaction-driven. The test-only request lets the
+    // process-level smoke test exercise one refresh and exit without a tray host.
+    if exit_after_refresh {
+        let _ = refresh_sender.try_send(());
+    }
 
     let update_handle = handle.clone();
     thread::spawn(move || {
@@ -342,12 +339,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .is_some();
             finish_refresh(updated, exit_after_refresh, &refresh_exit_sender)
         };
-        run_refresh_loop(
-            &refresh_receiver,
-            AUTO_REFRESH_INTERVAL,
-            &mut read,
-            &mut update,
-        );
+        run_refresh_loop(&refresh_receiver, &mut read, &mut update);
     });
 
     let mut is_closed = || handle.is_closed();

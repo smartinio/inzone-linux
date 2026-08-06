@@ -88,9 +88,9 @@ omits the case because it cannot update while the earbuds are outside it. The
 status refreshes when the icon is clicked or its tooltip is requested on hover.
 The menu also provides Refresh and Quit actions.
 Battery reads run outside the D-Bus menu thread so an unavailable receiver does
-not freeze Plasma's tray UI. It queries once at startup, automatically refreshes
-once a minute, and also lets you request an immediate refresh. Automatic and
-manual requests share one worker and cannot run concurrently.
+not freeze Plasma's tray UI. It schedules no startup or periodic reads: a battery
+read is requested only when you hover over or click the icon, or select Refresh.
+Requests share one worker and cannot run concurrently.
 
 To install both binaries into Cargo's user binary directory:
 

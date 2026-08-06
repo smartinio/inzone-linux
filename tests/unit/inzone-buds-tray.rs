@@ -50,22 +50,20 @@ fn discovered() -> Result<PathBuf, inzone_buds::Error> {
 }
 
 #[test]
-fn refreshes_for_manual_requests_and_timer_expiry() {
-    let (sender, receiver) = mpsc::sync_channel(1);
-    sender.try_send(()).unwrap();
-    assert!(wait_for_refresh(&receiver, Duration::from_secs(1)));
-    assert!(wait_for_refresh(&receiver, Duration::ZERO));
-}
-
-#[test]
-fn stops_refreshing_when_all_senders_are_gone() {
-    let (sender, receiver) = mpsc::sync_channel(1);
-    drop(sender);
-    assert!(!wait_for_refresh(&receiver, Duration::ZERO));
-}
-
-#[test]
 fn exposes_every_tray_state_and_property() {
+    let (idle, _, _) = tray(ReadingStatus::Idle);
+    assert_eq!(
+        idle.summary(),
+        "Hover, click, or refresh to read battery status"
+    );
+    assert!(matches!(idle.status(), Status::Active));
+    assert_eq!(
+        standard(idle.menu().into_iter().next().unwrap())
+            .unwrap()
+            .label,
+        "Battery status not read yet"
+    );
+
     let (loading, _, _) = tray(ReadingStatus::Loading);
     assert_eq!(loading.summary(), "Reading battery status…");
     assert_eq!(loading.id(), "inzone-buds-linux");
@@ -195,6 +193,16 @@ fn icon_clicks_and_hover_request_a_refresh() {
     // Repeated tooltip property reads for one hover must not queue more work.
     let _ = hovered.tool_tip();
     assert!(hover_receiver.try_recv().is_err());
+
+    // The first hover must refresh immediately, even just after startup.
+    let (idle, idle_receiver, _) = tray(ReadingStatus::Idle);
+    *idle
+        .last_refresh_activity
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Instant::now() - HOVER_REFRESH_COOLDOWN;
+    let _ = idle.tool_tip();
+    idle_receiver.try_recv().unwrap();
 }
 
 #[test]
@@ -213,8 +221,9 @@ fn reads_batteries_through_both_error_boundaries() {
 }
 
 #[test]
-fn refresh_worker_maps_success_error_timer_and_shutdown() {
+fn refresh_worker_only_reads_for_requests_and_stops_on_shutdown() {
     let (sender, receiver) = mpsc::channel();
+    sender.send(()).unwrap();
     sender.send(()).unwrap();
     drop(sender);
     let mut reads = 0;
@@ -231,18 +240,27 @@ fn refresh_worker_maps_success_error_timer_and_shutdown() {
         states.push(status);
         true
     };
-    run_refresh_loop(&receiver, Duration::from_secs(1), &mut read, &mut update);
+    run_refresh_loop(&receiver, &mut read, &mut update);
     assert_eq!(states.len(), 2);
     assert!(matches!(states[0], ReadingStatus::Ready(_)));
     assert!(matches!(states[1], ReadingStatus::Error(_)));
 
-    let (_sender, receiver) = mpsc::channel();
+    let (sender, receiver) = mpsc::channel();
+    sender.send(()).unwrap();
+    run_refresh_loop(&receiver, &mut || Ok(reading()), &mut |_| false);
+
+    let (sender, receiver) = mpsc::channel();
+    drop(sender);
+    let mut read_called = false;
     run_refresh_loop(
         &receiver,
-        Duration::ZERO,
-        &mut || Ok(reading()),
-        &mut |_| false,
+        &mut || {
+            read_called = true;
+            Ok(reading())
+        },
+        &mut |_| true,
     );
+    assert!(!read_called);
 }
 
 #[test]
